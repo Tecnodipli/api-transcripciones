@@ -3,7 +3,9 @@ import os
 import re
 import zipfile
 from typing import List, Tuple, Dict, Any, Optional
-
+import uuid
+from datetime import datetime, timedelta
+from fastapi import BackgroundTasks
 from fastapi import FastAPI, File, UploadFile, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -66,6 +68,15 @@ ETIQUETAS_INVALIDAS_PATRONES = [
 # =========================
 # Utilidades
 # =========================
+DOWNLOADS: Dict[str, Tuple[bytes, datetime]] = {}
+DOWNLOAD_TTL_MINUTES = 15
+
+def cleanup_downloads():
+    now = datetime.utcnow()
+    expirados = [k for k, (_, exp) in DOWNLOADS.items() if exp <= now]
+    for k in expirados:
+        DOWNLOADS.pop(k, None)
+        
 def read_excel_questions(excel_bytes: bytes) -> List[str]:
     """Lee la columna C del .xlsx como matriz de referencia."""
     df = pd.read_excel(io.BytesIO(excel_bytes), usecols="C", engine="openpyxl").dropna()
@@ -265,3 +276,70 @@ async def analyze_zip_endpoint(
 @app.get("/health")
 def health():
     return {"ok": True, "service": "validator", "version": "1.0.0"}
+
+@app.post("/analyze-zip-url")
+async def analyze_zip_url_endpoint(
+    background_tasks: BackgroundTasks,
+    documentos: List[UploadFile] = File(..., description="Máximo 10 archivos .docx"),
+    preguntas_excel: UploadFile = File(..., description="Archivo .xlsx con matriz de preguntas (columna C)"),
+    x_token: Optional[str] = Header(default=None)
+):
+    check_token(x_token)
+
+    docx_files = [f for f in documentos if f.filename.lower().endswith(".docx")]
+    if len(docx_files) == 0:
+        return JSONResponse(status_code=400, content={"ok": False, "message": "Debes adjuntar al menos un .docx"})
+    if len(docx_files) > MAX_DOCX:
+        docx_files = docx_files[:MAX_DOCX]
+
+    if not preguntas_excel.filename.lower().endswith(".xlsx"):
+        return JSONResponse(status_code=400, content={"ok": False, "message": "Debes adjuntar un .xlsx de preguntas"})
+
+    preguntas_ref = read_excel_questions(await preguntas_excel.read())
+
+    mem_zip = io.BytesIO()
+    with zipfile.ZipFile(mem_zip, "w", zipfile.ZIP_DEFLATED) as zipf:
+        for f in docx_files:
+            contenido = await f.read()
+            resultado = analizar_un_docx(f.filename, contenido, preguntas_ref)
+
+            base = os.path.splitext(os.path.basename(f.filename))[0]
+            errores_txt = io.StringIO()
+            resumen_txt = io.StringIO()
+
+            if resultado["errores"]:
+                for e in resultado["errores"]:
+                    errores_txt.write(f"Línea {e['linea']}: {e['tipo_error']} - {e['descripcion']}\n")
+            else:
+                errores_txt.write("Sin errores detectados.\n")
+
+            if resultado["resumen"]:
+                for tipo, count in resultado["resumen"].items():
+                    resumen_txt.write(f"{tipo}: {count} ocurrencias\n")
+            else:
+                resumen_txt.write("Sin errores que resumir.\n")
+
+            zipf.writestr(f"{base}_errores.txt", errores_txt.getvalue())
+            zipf.writestr(f"{base}_resumen.txt", resumen_txt.getvalue())
+
+    mem_zip.seek(0)
+
+    token = uuid.uuid4().hex
+    DOWNLOADS[token] = (mem_zip.getvalue(), datetime.utcnow() + timedelta(minutes=DOWNLOAD_TTL_MINUTES))
+    background_tasks.add_task(cleanup_downloads)
+
+    base_url = os.getenv("PUBLIC_BASE_URL", "https://api-transcripciones.onrender.com")
+    return {"ok": True, "url": f"{base_url}/download/{token}", "expires_in_minutes": DOWNLOAD_TTL_MINUTES}
+
+@app.get("/download/{token}")
+def download_token(token: str):
+    cleanup_downloads()
+    item = DOWNLOADS.get(token)
+    if not item:
+        raise HTTPException(status_code=404, detail="Link expirado o inválido")
+    data, exp = item
+    if exp <= datetime.utcnow():
+        DOWNLOADS.pop(token, None)
+        raise HTTPException(status_code=410, detail="Link expirado")
+    headers = {"Content-Disposition": "attachment; filename=reportes_transcripciones.zip"}
+    return StreamingResponse(io.BytesIO(data), media_type="application/zip", headers=headers)
