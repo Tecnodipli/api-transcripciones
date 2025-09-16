@@ -1,27 +1,23 @@
-import io
 import os
 import re
+import unicodedata
 import zipfile
-from typing import List, Tuple, Dict, Any, Optional
+import io
 import uuid
+from collections import Counter
 from datetime import datetime, timedelta
-from fastapi import BackgroundTasks
-from fastapi import FastAPI, File, UploadFile, Header, HTTPException
+from io import BytesIO
+
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel
-
 from docx import Document
-import pandas as pd
 
-# =========================
-# Configuración básica
-# =========================
-MAX_DOCX = 10
+app = FastAPI(title="Validador de Transcripciones")
 
-app = FastAPI(title="Validador de Transcripciones DOCX vs Excel")
-
-# CORS: tu dominio en producción
+# ==========================
+# CORS: habilitar solo tus dominios
+# ==========================
 ALLOWED_ORIGINS = [
     "https://www.dipli.ai",
     "https://dipli.ai",
@@ -29,6 +25,7 @@ ALLOWED_ORIGINS = [
     "https://isagarcivill09.wixsite.com/turop/tienda",
     "https://isagarcivill09-wixsite-com.filesusr.com"
 ]
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
@@ -37,299 +34,149 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Token opcional (recomendado en producción)
-API_TOKEN: Optional[str] = os.getenv("API_TOKEN", None)
-
-def check_token(x_token: Optional[str]):
-    # Si no configuras API_TOKEN en el entorno, no se valida (modo dev)
-    if API_TOKEN is None:
-        return
-    if x_token != API_TOKEN:
-        raise HTTPException(status_code=401, detail="Unauthorized")
-
-# =========================
-# Reglas de validación
-# =========================
-ETIQUETAS_VALIDAS = ["ENTREVISTADOR", "ENTREVISTADORA", "ENTREVISTADO", "ENTREVISTADA"]
-ETIQUETAS_INVALIDAS_PATRONES = [
-    r"\bUsuario\b",
-    r"\bX{3,}\b",
-    r"\bXxxxxxx\b",
-    r"\bEntrevistador[a-z]*\b",
-    r"\bEntrevistado[a-z]*\b",
-    r"\bentrevistador[a-z]*\b",
-    r"\bentrevistado[a-z]*\b",
-    r"\bModerador[a-z]*\b",
-    r"\bmoderador[a-z]*\b",
-    r"\bSpeaker[a-z]*\b",
-    r"\bSPEAKER[a-z]*\b",
-]
-
-# =========================
-# Utilidades
-# =========================
-DOWNLOADS: Dict[str, Tuple[bytes, datetime]] = {}
-DOWNLOAD_TTL_MINUTES = 15
+# ==========================
+# Almacenamiento temporal de descargas
+# ==========================
+DOWNLOADS = {}
+EXP_MINUTES = 5  # tiempo de expiración del link
 
 def cleanup_downloads():
+    """Eliminar tokens expirados"""
     now = datetime.utcnow()
-    expirados = [k for k, (_, exp) in DOWNLOADS.items() if exp <= now]
-    for k in expirados:
-        DOWNLOADS.pop(k, None)
-        
-def read_excel_questions(excel_bytes: bytes) -> List[str]:
-    """Lee la columna C del .xlsx como matriz de referencia."""
-    df = pd.read_excel(io.BytesIO(excel_bytes), usecols="C", engine="openpyxl").dropna()
-    return df.iloc[:, 0].astype(str).tolist()
+    expired = [t for t, (_, exp) in DOWNLOADS.items() if exp <= now]
+    for t in expired:
+        DOWNLOADS.pop(t, None)
 
-def doc_from_bytes(docx_bytes: bytes) -> Document:
-    return Document(io.BytesIO(docx_bytes))
+# ==========================
+# Validaciones
+# ==========================
+ETIQUETAS_VALIDAS = ["ENTREVISTADOR:", "ENTREVISTADORA:", "ENTREVISTADO:", "ENTREVISTADA:"]
+REGEX_PERMITIDOS = r"[^A-Za-zÁÉÍÓÚáéíóúÑñ0-9\s\.,:\?¿]"
 
-def validar_negrita_entrevistador(doc: Document) -> List[Tuple[int, str, str]]:
+def char_human(ch: str) -> str:
+    code = f"U+{ord(ch):04X}"
+    name = unicodedata.name(ch, "UNKNOWN")
+    visible = ch if not ch.isspace() else repr(ch)
+    return f"{visible} ({code} {name})"
+
+def validar_y_limpiar(doc: Document, filename: str):
     errores = []
+    especiales_count = 0
+    char_counter = Counter()
+
     for i, para in enumerate(doc.paragraphs):
         texto = para.text.strip()
-        if texto.startswith("ENTREVISTADOR:") or texto.startswith("ENTREVISTADORA:"):
-            is_bold = True
-            for run in para.runs:
-                if run.text.strip() and not run.bold:
-                    is_bold = False
-                    break
-            if not is_bold:
-                errores.append((
-                    i + 1,
-                    "Formato en negrita",
-                    f"Texto de {texto.split(':')[0]} no está completamente en negrita."
-                ))
-    return errores
+        if not texto:
+            continue
 
-def validar_etiquetas_docx(doc: Document) -> List[Tuple[int, str, str]]:
-    errores = []
-    for i, para in enumerate(doc.paragraphs):
-        texto = para.text.strip()
-        match = re.match(r"^([A-Z]+):", texto)
+        texto_norm = texto.lower()
+
+        # Ignorar timestamps tipo mm:ss
+        if re.fullmatch(r"\d{1,2}:\d{2}", texto):
+            continue
+
+        # Validaciones etiquetas
+        if "speaker" in texto_norm:
+            errores.append((i+1, "Etiqueta inválida", f"Se encontró '{texto}'. Usa 'ENTREVISTADOR:' o 'ENTREVISTADO:'."))
+
+        if "usuario" in texto_norm:
+            errores.append((i+1, "Etiqueta inválida", f"Se encontró 'Usuario'. Usa 'ENTREVISTADO:' o 'ENTREVISTADOR:'."))
+
+        if "xxx" in texto_norm:
+            errores.append((i+1, "Etiqueta inválida", f"Se encontró '{texto}'. Reemplázalo por la etiqueta correcta."))
+
+        match = re.match(r"^([A-ZÁÉÍÓÚÑ]+:)", texto)
         if match:
             etiqueta = match.group(1)
             if etiqueta not in ETIQUETAS_VALIDAS:
-                errores.append((i + 1, "Etiqueta inválida", f"Etiqueta '{etiqueta}' no es válida."))
-            elif etiqueta in ["ENTREVISTADOR", "ENTREVISTADORA"]:
-                # Debe existir una run en negrita que contenga la etiqueta
-                if not any(run.bold and etiqueta in run.text for run in para.runs):
-                    errores.append((i + 1, "Encabezado sin negrita", f"Etiqueta '{etiqueta}' debería estar en negrita."))
-    return errores
+                errores.append((i+1, "Etiqueta inválida", f"Se encontró '{etiqueta}'. Usa solo {ETIQUETAS_VALIDAS}"))
+            else:
+                if texto == etiqueta:
+                    errores.append((i+1, "Formato incorrecto", f"La etiqueta '{etiqueta}' está sola. Debe ir junto con el texto."))
 
-def detectar_etiquetas_invalidas(doc: Document) -> List[Tuple[int, str, str]]:
-    errores = []
-    for i, para in enumerate(doc.paragraphs):
-        texto = para.text.strip()
-        for patron in ETIQUETAS_INVALIDAS_PATRONES:
-            if re.search(patron, texto, re.IGNORECASE):
-                errores.append((i + 1, "Etiqueta inválida", f"Se encontró coincidencia con patrón: {patron}"))
-                break
-    return errores
+                if etiqueta in ["ENTREVISTADOR:", "ENTREVISTADORA:"]:
+                    encabezado_ok = any(run.text.strip().startswith(etiqueta) and run.bold for run in para.runs)
+                    if not encabezado_ok:
+                        errores.append((i+1, "Encabezado sin negrita", f"La etiqueta '{etiqueta}' debería estar en negrita."))
 
-def extraer_preguntas_docx(doc: Document) -> List[Tuple[int, str]]:
-    """Extrae oraciones que terminan con '?' (incluye español)."""
-    patron_pregunta = re.compile(r"[^?\n]+\?")
-    preguntas = []
-    for i, para in enumerate(doc.paragraphs):
-        matches = patron_pregunta.findall(para.text)
-        for pregunta in matches:
-            pregunta_limpia = pregunta.strip()
-            if pregunta_limpia:
-                preguntas.append((i + 1, pregunta_limpia))
-    return preguntas
+                    all_bold = all(run.bold or not run.text.strip() for run in para.runs)
+                    if not all_bold:
+                        errores.append((i+1, "Formato en negrita", f"El texto de '{etiqueta}' debería estar completamente en negrita."))
 
-def comparar_preguntas(preguntas_docx: List[Tuple[int, str]], preguntas_ref: List[str]) -> List[Tuple[int, str, str]]:
-    errores = []
-    for linea, pregunta in preguntas_docx:
-        if pregunta not in preguntas_ref:
-            errores.append((linea, "Pregunta no coincide", f"'{pregunta}' no está en la matriz de referencia"))
-    return errores
-
-def validar_fuente_tamano(doc: Document) -> List[Tuple[int, str, str]]:
-    errores = []
-    for i, para in enumerate(doc.paragraphs):
+        # Fuente/tamaño
         for run in para.runs:
             fuente = run.font.name
-            tam = run.font.size.pt if run.font.size else None  # .pt puede ser None
+            tamano = run.font.size.pt if run.font.size else None
             if fuente and fuente.lower() != "arial":
-                errores.append((i + 1, "Fuente incorrecta", f"'{fuente}' en vez de Arial"))
+                errores.append((i+1, "Fuente incorrecta", f"Se detectó la fuente '{fuente}' en vez de Arial."))
                 break
-            if tam and tam != 12:
-                errores.append((i + 1, "Tamaño incorrecto", f"{tam}pt en vez de 12pt"))
+            if tamano and tamano != 12:
+                errores.append((i+1, "Tamaño incorrecto", f"Se detectó {tamano}pt en vez de 12pt."))
                 break
-    return errores
 
-def validar_intervencion_vacia(doc: Document) -> List[Tuple[int, str, str]]:
-    errores = []
-    for i, para in enumerate(doc.paragraphs):
-        if re.match(r"^(ENTREVISTAD[OA]|ENTREVISTADOR[OA]):\s*$", para.text.strip()):
-            errores.append((i + 1, "Intervención vacía tras etiqueta", "Debe ir junto al texto, sin salto de línea"))
-    return errores
+        # Limpieza
+        for run in para.runs:
+            if run.text:
+                encontrados = re.findall(REGEX_PERMITIDOS, run.text)
+                if encontrados:
+                    especiales_count += len(encontrados)
+                    char_counter.update(encontrados)
+                    run.text = re.sub(REGEX_PERMITIDOS, "", run.text)
 
-def analizar_un_docx(nombre: str, docx_bytes: bytes, preguntas_ref: List[str]) -> Dict[str, Any]:
-    doc = doc_from_bytes(docx_bytes)
+    # Guardar en memoria
+    docx_bytes = BytesIO()
+    doc.save(docx_bytes)
+    docx_bytes.seek(0)
 
-    errores: List[Tuple[int, str, str]] = []
-    errores += comparar_preguntas(extraer_preguntas_docx(doc), preguntas_ref)
-    errores += validar_etiquetas_docx(doc)
-    errores += validar_negrita_entrevistador(doc)
-    errores += validar_fuente_tamano(doc)
-    errores += validar_intervencion_vacia(doc)
-    errores += detectar_etiquetas_invalidas(doc)
+    # Crear reporte
+    txt_bytes = BytesIO()
+    resumen = {}
 
-    errores_list = [{"linea": l, "tipo_error": t, "descripcion": d} for (l, t, d) in errores]
-    resumen: Dict[str, int] = {}
-    for e in errores_list:
-        resumen[e["tipo_error"]] = resumen.get(e["tipo_error"], 0) + 1
+    txt_bytes.write(f"📋 REPORTE DE ERRORES\nArchivo: {filename}\nGenerado: {datetime.now()}\n\n".encode("utf-8"))
+    for linea, tipo, desc in errores:
+        txt_bytes.write(f"Línea {linea}: {tipo} → {desc}\n".encode("utf-8"))
+        resumen[tipo] = resumen.get(tipo, 0) + 1
 
-    return {"archivo": nombre, "resumen": resumen, "errores": errores_list}
+    if resumen:
+        txt_bytes.write("\n--- RESUMEN DE ERRORES ---\n".encode("utf-8"))
+        for tipo, count in resumen.items():
+            txt_bytes.write(f"{tipo}: {count} ocurrencias\n".encode("utf-8"))
 
-# =========================
-# Modelos de respuesta
-# =========================
-class AnalyzeResponse(BaseModel):
-    ok: bool
-    total_archivos: int
-    resultados: List[Dict[str, Any]]
+    txt_bytes.write("\n--- LIMPIEZA DE TEXTO ---\n".encode("utf-8"))
+    txt_bytes.write(f"Total de caracteres especiales eliminados: {especiales_count}\n".encode("utf-8"))
+    txt_bytes.write(f"Tipos únicos eliminados: {len(char_counter)}\n".encode("utf-8"))
+    if char_counter:
+        txt_bytes.write("\nDetalle por carácter:\n".encode("utf-8"))
+        for ch, cnt in char_counter.most_common():
+            txt_bytes.write(f"  {char_human(ch)} → {cnt}\n".encode("utf-8"))
 
-# =========================
-# Endpoints
-# =========================
-@app.post("/analyze", response_model=AnalyzeResponse)
-async def analyze_endpoint(
-    documentos: List[UploadFile] = File(..., description="Máximo 10 archivos .docx"),
-    preguntas_excel: UploadFile = File(..., description="Archivo .xlsx con matriz de preguntas (columna C)"),
-    x_token: Optional[str] = Header(default=None)
-):
-    check_token(x_token)
+    txt_bytes.seek(0)
 
-    docx_files = [f for f in documentos if f.filename.lower().endswith(".docx")]
-    if len(docx_files) == 0:
-        return JSONResponse(status_code=400, content={"ok": False, "message": "Debes adjuntar al menos un .docx"})
-    if len(docx_files) > MAX_DOCX:
-        docx_files = docx_files[:MAX_DOCX]
+    return docx_bytes, txt_bytes
 
-    if not preguntas_excel.filename.lower().endswith(".xlsx"):
-        return JSONResponse(status_code=400, content={"ok": False, "message": "Debes adjuntar un .xlsx de preguntas"})
 
-    preguntas_ref = read_excel_questions(await preguntas_excel.read())
+@app.post("/procesar/")
+async def procesar(file: UploadFile = File(...)):
+    try:
+        doc = Document(file.file)
+    except Exception as e:
+        return {"error": f"No se pudo abrir el archivo: {e}"}
 
-    resultados = []
-    for f in docx_files:
-        contenido = await f.read()
-        resultados.append(analizar_un_docx(f.filename, contenido, preguntas_ref))
+    docx_bytes, txt_bytes = validar_y_limpiar(doc, file.filename)
 
-    return AnalyzeResponse(ok=True, total_archivos=len(resultados), resultados=resultados)
+    # Crear ZIP en memoria
+    zip_buffer = io.BytesIO()
+    with zipfile.ZipFile(zip_buffer, "w") as zipf:
+        zipf.writestr(file.filename.replace(".docx", "_limpio.docx"), docx_bytes.read())
+        zipf.writestr(file.filename.replace(".docx", "_errores.txt"), txt_bytes.read())
+    zip_buffer.seek(0)
 
-@app.post("/analyze-zip")
-async def analyze_zip_endpoint(
-    documentos: List[UploadFile] = File(..., description="Máximo 10 archivos .docx"),
-    preguntas_excel: UploadFile = File(..., description="Archivo .xlsx con matriz de preguntas (columna C)"),
-    x_token: Optional[str] = Header(default=None)
-):
-    check_token(x_token)
+    # Crear token único
+    token = str(uuid.uuid4())
+    DOWNLOADS[token] = (zip_buffer.getvalue(), datetime.utcnow() + timedelta(minutes=EXP_MINUTES))
 
-    docx_files = [f for f in documentos if f.filename.lower().endswith(".docx")]
-    if len(docx_files) == 0:
-        return JSONResponse(status_code=400, content={"ok": False, "message": "Debes adjuntar al menos un .docx"})
-    if len(docx_files) > MAX_DOCX:
-        docx_files = docx_files[:MAX_DOCX]
+    return JSONResponse({"token": token, "expires_in": EXP_MINUTES})
 
-    if not preguntas_excel.filename.lower().endswith(".xlsx"):
-        return JSONResponse(status_code=400, content={"ok": False, "message": "Debes adjuntar un .xlsx de preguntas"})
-
-    preguntas_ref = read_excel_questions(await preguntas_excel.read())
-
-    mem_zip = io.BytesIO()
-    with zipfile.ZipFile(mem_zip, "w", zipfile.ZIP_DEFLATED) as zipf:
-        for f in docx_files:
-            contenido = await f.read()
-            resultado = analizar_un_docx(f.filename, contenido, preguntas_ref)
-
-            base = os.path.splitext(os.path.basename(f.filename))[0]
-            errores_txt = io.StringIO()
-            resumen_txt = io.StringIO()
-
-            # Detalle de errores
-            if resultado["errores"]:
-                for e in resultado["errores"]:
-                    errores_txt.write(f"Línea {e['linea']}: {e['tipo_error']} - {e['descripcion']}\n")
-            else:
-                errores_txt.write("Sin errores detectados.\n")
-
-            # Resumen por tipo
-            if resultado["resumen"]:
-                for tipo, count in resultado["resumen"].items():
-                    resumen_txt.write(f"{tipo}: {count} ocurrencias\n")
-            else:
-                resumen_txt.write("Sin errores que resumir.\n")
-
-            zipf.writestr(f"{base}_errores.txt", errores_txt.getvalue())
-            zipf.writestr(f"{base}_resumen.txt", resumen_txt.getvalue())
-
-    mem_zip.seek(0)
-    headers = {"Content-Disposition": "attachment; filename=reportes_transcripciones.zip"}
-    return StreamingResponse(mem_zip, media_type="application/zip", headers=headers)
-
-@app.get("/health")
-def health():
-    return {"ok": True, "service": "validator", "version": "1.0.0"}
-
-@app.post("/analyze-zip-url")
-async def analyze_zip_url_endpoint(
-    background_tasks: BackgroundTasks,
-    documentos: List[UploadFile] = File(..., description="Máximo 10 archivos .docx"),
-    preguntas_excel: UploadFile = File(..., description="Archivo .xlsx con matriz de preguntas (columna C)"),
-    x_token: Optional[str] = Header(default=None)
-):
-    check_token(x_token)
-
-    docx_files = [f for f in documentos if f.filename.lower().endswith(".docx")]
-    if len(docx_files) == 0:
-        return JSONResponse(status_code=400, content={"ok": False, "message": "Debes adjuntar al menos un .docx"})
-    if len(docx_files) > MAX_DOCX:
-        docx_files = docx_files[:MAX_DOCX]
-
-    if not preguntas_excel.filename.lower().endswith(".xlsx"):
-        return JSONResponse(status_code=400, content={"ok": False, "message": "Debes adjuntar un .xlsx de preguntas"})
-
-    preguntas_ref = read_excel_questions(await preguntas_excel.read())
-
-    mem_zip = io.BytesIO()
-    with zipfile.ZipFile(mem_zip, "w", zipfile.ZIP_DEFLATED) as zipf:
-        for f in docx_files:
-            contenido = await f.read()
-            resultado = analizar_un_docx(f.filename, contenido, preguntas_ref)
-
-            base = os.path.splitext(os.path.basename(f.filename))[0]
-            errores_txt = io.StringIO()
-            resumen_txt = io.StringIO()
-
-            if resultado["errores"]:
-                for e in resultado["errores"]:
-                    errores_txt.write(f"Línea {e['linea']}: {e['tipo_error']} - {e['descripcion']}\n")
-            else:
-                errores_txt.write("Sin errores detectados.\n")
-
-            if resultado["resumen"]:
-                for tipo, count in resultado["resumen"].items():
-                    resumen_txt.write(f"{tipo}: {count} ocurrencias\n")
-            else:
-                resumen_txt.write("Sin errores que resumir.\n")
-
-            zipf.writestr(f"{base}_errores.txt", errores_txt.getvalue())
-            zipf.writestr(f"{base}_resumen.txt", resumen_txt.getvalue())
-
-    mem_zip.seek(0)
-
-    token = uuid.uuid4().hex
-    DOWNLOADS[token] = (mem_zip.getvalue(), datetime.utcnow() + timedelta(minutes=DOWNLOAD_TTL_MINUTES))
-    background_tasks.add_task(cleanup_downloads)
-
-    base_url = os.getenv("PUBLIC_BASE_URL", "https://api-transcripciones.onrender.com")
-    return {"ok": True, "url": f"{base_url}/download/{token}", "expires_in_minutes": DOWNLOAD_TTL_MINUTES}
 
 @app.get("/download/{token}")
 def download_token(token: str):
