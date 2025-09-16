@@ -24,7 +24,8 @@ ALLOWED_ORIGINS = [
     "https://www.dipli.ai",
     "https://dipli.ai",
     "https://isagarcivill09.wixsite.com/turop",
-    "https://isagarcivill09.wixsite.com/turop/tienda"
+    "https://isagarcivill09.wixsite.com/turop/tienda",
+    "https://isagarcivill09-wixsite-com.filesusr.com"
 ]
 app.add_middleware(
     CORSMiddleware,
