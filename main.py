@@ -23,6 +23,8 @@ app = FastAPI(title="Validador de Transcripciones DOCX vs Excel")
 ALLOWED_ORIGINS = [
     "https://www.dipli.ai",
     "https://dipli.ai",
+    "https://isagarcivill09.wixsite.com/turop",
+    "https://isagarcivill09.wixsite.com/turop/tienda"
 ]
 app.add_middleware(
     CORSMiddleware,
